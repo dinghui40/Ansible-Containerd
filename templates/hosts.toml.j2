@@ -1,0 +1,23 @@
+{% set sv = item.server | default('https://' ~ item.registry) %}
+{% set ms = item.mirrors | default([]) %}
+{% set auth = (item.auth.username | default('') | length) > 0 %}
+{% set insecure = item.insecure | default(false) %}
+{% if ms | length > 0 %}server = "{{ sv }}"
+
+{% for m in ms %}[host."{{ m.host }}"]
+  capabilities = {{ (m.capabilities | default(['pull', 'resolve'])) | to_json }}
+{% if m.skip_verify | default(false) %}  skip_verify = true
+{% endif %}{% if not loop.last %}
+
+{% endif %}{% endfor %}
+{% endif %}{% if insecure or auth %}{% if ms | length > 0 %}
+
+{% endif %}[host."{{ sv }}"]
+  capabilities = ["pull", "resolve", "push"]
+{% if insecure %}  skip_verify = true
+{% endif %}{% if auth %}
+
+  [host."{{ sv }}".auth]
+    username = "{{ item.auth.username }}"
+    password = "{{ item.auth.password | default('') }}"
+{% endif %}{% endif %}

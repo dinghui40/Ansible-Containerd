@@ -1,0 +1,446 @@
+---
+# Containerd 二进制安装剧本
+# 安装包包函: containerd / runc / CNI 插件 / crictl / nerdctl
+#
+# 常用用法:
+#   全量安装:               ansible-playbook containerd.yml -e containerd_install_all=true
+#   全量安装并排除组件:      ansible-playbook containerd.yml -e containerd_install_all=true -e containerd_install_nerdctl=false
+#   仅安装单个组件:         ansible-playbook containerd.yml -e containerd_install_containerd=true
+#   仅安装单个组件 only:    ansible-playbook containerd.yml -e containerd_install_only=containerd
+#   缺包时自动下载:         ansible-playbook containerd.yml -e containerd_auto_download=true
+#   仅对指定主机执行:       ansible-playbook containerd.yml --limit 192.168.1.100
+#
+# 版本 / 路径 / 行为开关 : vars/containerd.yml
+# 仓库 / 镜像加速 / 认证  : vars/registry.yml
+
+- name: 二进制安装 Containerd
+  hosts: containerd_nodes
+  become: true          # 全程以 root 执行
+  gather_facts: true    # 需要目标机系统信息
+
+  vars_files:
+    - vars/containerd.yml
+    - vars/registry.yml
+
+  tasks:
+    # ---------- 阶段一: 校验开关与安装包 ----------
+    - name: 1.校验组件开关
+      ansible.builtin.fail:
+        msg:
+          - "未启用任何组件: 5 个组件开关均为未指定或 false, 且 containerd_install_all 不是 true."
+          - "当前生效值: containerd={{ containerd_do_containerd }} runc={{ containerd_do_runc }} cni={{ containerd_do_cni }} crictl={{ containerd_do_crictl }} nerdctl={{ containerd_do_nerdctl }}"
+          - "全量安装: -e containerd_install_all=true"
+          - "全量安装并排除组件: -e containerd_install_all=true -e containerd_install_crictl=false"
+          - "仅安装单个组件: -e containerd_install_runc=true, 或 -e containerd_install_only=runc"
+      when: not ((containerd_do_containerd | bool) or (containerd_do_runc | bool)
+                 or (containerd_do_cni | bool) or (containerd_do_crictl | bool)
+                 or (containerd_do_nerdctl | bool))
+
+    - name: 2.计算本次需要的安装包
+      ansible.builtin.set_fact:
+        # 需要检查与安装的全部包
+        containerd_pkgs_in_use: >-
+          {{ ([containerd_pkg] if (containerd_do_containerd | bool) else [])
+             + ([runc_pkg] if (containerd_do_runc | bool) else [])
+             + ([cni_plugins_pkg] if (containerd_do_cni | bool) else [])
+             + ([crictl_pkg] if (containerd_do_crictl | bool) else [])
+             + ([nerdctl_pkg] if (containerd_do_nerdctl | bool) else []) }}
+        # 需要分发到目标机再解压的压缩包 (runc 与 nerdctl / crictl 直接安装, 不经过临时目录)
+        containerd_stage_pkgs: >-
+          {{ ([containerd_pkg] if (containerd_do_containerd | bool) else [])
+             + ([cni_plugins_pkg] if (containerd_do_cni | bool) else []) }}
+
+    - name: 3.检测控制节点上的安装包
+      ansible.builtin.stat:
+        path: "{{ packages_dir }}/{{ item }}"
+      loop: "{{ containerd_pkgs_in_use }}"
+      delegate_to: localhost
+      run_once: true
+      register: containerd_pkg_stat
+      changed_when: false
+
+    - name: 4.统计缺失的安装包
+      ansible.builtin.set_fact:
+        containerd_missing_pkgs: >-
+          {{ containerd_pkg_stat.results | selectattr('stat.exists', 'equalto', false)
+             | map(attribute='item') | list }}
+      run_once: true
+
+    - name: 5.缺失时提示手动执行下载脚本
+      ansible.builtin.fail:
+        msg:
+          - "控制节点缺少以下安装包:"
+          - "{{ containerd_missing_pkgs }}"
+          - ""
+          - "请先执行下载脚本后重跑本剧本:"
+          - "  cd {{ playbook_dir }} && bash {{ download_script | basename }}"
+          - ""
+          - "如需剧本自动下载, 追加参数: -e containerd_auto_download=true"
+      when:
+        - containerd_missing_pkgs | length > 0
+        - not (containerd_auto_download | bool)
+      delegate_to: localhost
+      run_once: true
+
+    - name: 6.缺失时自动执行下载脚本
+      ansible.builtin.command:
+        cmd: >-
+          bash {{ download_script }} --need
+          {{ (([ 'containerd' ] if (containerd_pkg in containerd_missing_pkgs) else [])
+              + ([ 'runc' ] if (runc_pkg in containerd_missing_pkgs) else [])
+              + ([ 'cni' ] if (cni_plugins_pkg in containerd_missing_pkgs) else [])
+              + ([ 'crictl' ] if (crictl_pkg in containerd_missing_pkgs) else [])
+              + ([ 'nerdctl' ] if (nerdctl_pkg in containerd_missing_pkgs) else [])) | join(',') }}
+        chdir: "{{ playbook_dir }}"
+      when:
+        - containerd_missing_pkgs | length > 0
+        - containerd_auto_download | bool
+      delegate_to: localhost
+      run_once: true
+      register: containerd_dl_result
+      changed_when: true
+
+    - name: 7.下载后复核安装包
+      ansible.builtin.stat:
+        path: "{{ packages_dir }}/{{ item }}"
+      loop: "{{ containerd_pkgs_in_use }}"
+      delegate_to: localhost
+      run_once: true
+      register: containerd_pkg_stat2
+      changed_when: false
+
+    - name: 8.断言安装包完整
+      ansible.builtin.assert:
+        that:
+          - item.stat.exists
+          - item.stat.size > 0
+        fail_msg: "安装包缺失或为空: {{ item.item }}, 请检查 {{ packages_dir }}"
+        quiet: true
+      loop: "{{ containerd_pkg_stat2.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+      delegate_to: localhost
+      run_once: true
+
+    # ---------- 阶段二: 准备目录并安装二进制 ----------
+    # 说明: copy 与 unarchive 均不会创建父目录, 目标目录必须先存在.
+    #   staging_dir            containerd / CNI 压缩包的解压落点, 仅在需要解压时创建
+    #   containerd_config_dir  config.toml 所在目录
+    #   cni_bin_dir            CNI 插件解压目录
+    #   runc 与二进制目录        安装目标文件的父目录
+    #   certs.d/<registry>      每个仓库一份 hosts.toml
+    - name: 9.计算本次需要创建的目录
+      ansible.builtin.set_fact:
+        containerd_needed_dirs: >-
+          {{ ([staging_dir] if (containerd_stage_pkgs | length > 0) else [])
+             + ([containerd_config_dir] if (containerd_do_containerd | bool) else [])
+             + ([cni_bin_dir] if (containerd_do_cni | bool) else [])
+             + ([runc_install_path | dirname] if (containerd_do_runc | bool) else [])
+             + ([containerd_bin_dir] if ((containerd_do_containerd | bool) or (containerd_do_crictl | bool) or (containerd_do_nerdctl | bool)) else [])
+             + ((containerd_registries | map(attribute="registry") | map("regex_replace", "^", containerd_certs_dir ~ "/") | list) if (containerd_do_containerd | bool) else []) }}
+
+    - name: 10.创建所需目录
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0755"
+      loop: "{{ containerd_needed_dirs }}"
+      loop_control:
+        label: "{{ item }}"
+
+    - name: 11.分发解压用安装包到目标机
+      ansible.builtin.copy:
+        src: "{{ packages_dir }}/{{ item }}"
+        dest: "{{ staging_dir }}/{{ item }}"
+        mode: "0644"
+      loop: "{{ containerd_stage_pkgs }}"
+      when: containerd_stage_pkgs | length > 0
+
+    - name: 12.解压 containerd 到 /usr/local
+      ansible.builtin.unarchive:
+        src: "{{ staging_dir }}/{{ containerd_pkg }}"
+        dest: /usr/local
+        remote_src: true          # 压缩包已在目标机上
+        creates: "{{ containerd_bin_dir }}/containerd"
+        extra_opts:
+          - --no-same-owner       # 不还原包内属主, 统一归 root
+      when: containerd_do_containerd | bool
+
+    - name: 13.安装 containerd.service
+      ansible.builtin.copy:
+        src: "{{ containerd_service_src }}"
+        dest: "{{ containerd_service_file }}"
+        mode: "0644"
+      register: containerd_svc
+      when: containerd_do_containerd | bool
+
+    - name: 14.启动并设置 containerd 开机自启
+      ansible.builtin.systemd:
+        name: containerd
+        enabled: true
+        state: started
+        daemon_reload: "{{ containerd_svc.changed }}"
+      register: containerd_svc_start
+      when: containerd_do_containerd | bool
+
+    - name: 15.安装 runc
+      ansible.builtin.copy:
+        src: "{{ packages_dir }}/{{ runc_pkg }}"
+        dest: "{{ runc_install_path }}"
+        mode: "0755"
+      when: containerd_do_runc | bool
+
+    - name: 16.解压 CNI 插件到 {{ cni_bin_dir }}
+      ansible.builtin.unarchive:
+        src: "{{ staging_dir }}/{{ cni_plugins_pkg }}"
+        dest: "{{ cni_bin_dir }}"
+        remote_src: true
+        creates: "{{ cni_bin_dir }}/bridge"
+        extra_opts:
+          - --no-same-owner
+      when: containerd_do_cni | bool
+
+    - name: 17.安装 nerdctl 到 {{ containerd_bin_dir }}
+      ansible.builtin.unarchive:
+        src: "{{ packages_dir }}/{{ nerdctl_pkg }}"
+        dest: "{{ containerd_bin_dir }}"
+        remote_src: false         # 从控制节点直接传输并解压
+        creates: "{{ containerd_bin_dir }}/nerdctl"
+        mode: "0755"
+      when: containerd_do_nerdctl | bool
+
+    - name: 18.安装 crictl 到 {{ containerd_bin_dir }}
+      ansible.builtin.unarchive:
+        src: "{{ packages_dir }}/{{ crictl_pkg }}"
+        dest: "{{ containerd_bin_dir }}"
+        remote_src: false
+        creates: "{{ containerd_bin_dir }}/crictl"
+        mode: "0755"
+      when: containerd_do_crictl | bool
+
+    - name: 19.写入 crictl 配置 /etc/crictl.yaml
+      ansible.builtin.copy:
+        src: "{{ crictl_config_src }}"
+        dest: "{{ crictl_config }}"
+        mode: "0644"
+      when: containerd_do_crictl | bool
+
+    # ---------- 阶段三: 配置 containerd ----------
+    - name: 20.生成 containerd 默认配置
+      ansible.builtin.shell:
+        cmd: "{{ containerd_bin_dir }}/containerd config default > {{ containerd_config_file }}"
+        creates: "{{ containerd_config_file }}"
+      register: containerd_cfg_default
+      when: containerd_do_containerd | bool
+
+    - name: 21.启用 SystemdCgroup 驱动
+      ansible.builtin.lineinfile:
+        path: "{{ containerd_config_file }}"
+        regexp: '^(\s*)SystemdCgroup\s*=.*$'
+        line: '\g<1>SystemdCgroup = true'
+        backrefs: true
+      register: containerd_cfg_systemd
+      when:
+        - containerd_do_containerd | bool
+        - containerd_systemd_cgroup | bool
+
+    - name: 22.设置 pause 沙箱镜像
+      ansible.builtin.lineinfile:
+        path: "{{ containerd_config_file }}"
+        regexp: '^(\s*sandbox\s*=\s*).*$'
+        line: '\1"{{ containerd_sandbox_image }}"'
+        backrefs: true
+      register: containerd_cfg_sandbox
+      when:
+        - containerd_do_containerd | bool
+        - containerd_sandbox_image | length > 0
+
+    - name: 23.设置镜像仓库证书目录 config_path
+      ansible.builtin.replace:
+        path: "{{ containerd_config_file }}"
+        # (?s) 允许匹配跨行; 只修改 images.registry 段中 config_path 的取值,
+        # 懒匹配配合 [^\n\[]*? 保证不会越过下一个配置段
+        regexp: >-
+          (?s)^(.*?\[plugins\.'io\.containerd\.cri\.v1\.images'\.registry\]\n)([^\n\[]*?)config_path\s*=\s*[^\n]*
+        replace: >-
+          \1\2config_path = '{{ containerd_registry_config_path }}'
+      register: containerd_cfg_path
+      when: containerd_do_containerd | bool
+
+    - name: 24.读取 config.toml 用于校验
+      ansible.builtin.slurp:
+        src: "{{ containerd_config_file }}"
+      register: containerd_cfg_raw
+      when: containerd_do_containerd | bool
+
+    - name: 25.筛选关键配置行
+      ansible.builtin.set_fact:
+        containerd_cfg_lines: >-
+          {{ (containerd_cfg_raw.content | b64decode).splitlines()
+             | select('search', 'SystemdCgroup|sandbox|config_path')
+             | list }}
+      when: containerd_do_containerd | bool
+
+    - name: 26.输出关键配置项
+      ansible.builtin.debug:
+        var: containerd_cfg_lines
+      when: containerd_do_containerd | bool
+
+    - name: 27.补写缺失的 config_path
+      ansible.builtin.blockinfile:
+        path: "{{ containerd_config_file }}"
+        marker: "# {mark} ANSIBLE MANAGED: registry config_path"
+        insertafter: "^\\s*\\[plugins\\.'io\\.containerd\\.cri\\.v1\\.images'\\.registry\\]"
+        block: |
+          config_path = "{{ containerd_registry_config_path }}"
+      register: containerd_cfg_block
+      when:
+        - containerd_do_containerd | bool
+        - (containerd_cfg_raw.content | b64decode) is not search('config_path')
+
+    - name: 28.按仓库列表生成 hosts.toml
+      ansible.builtin.template:
+        src: "{{ hosts_toml_template }}"
+        dest: "{{ containerd_certs_dir }}/{{ item.registry }}/hosts.toml"
+        mode: "0644"
+      loop: "{{ containerd_registries }}"
+      loop_control:
+        label: "{{ item.registry }}"
+      register: containerd_hosts_toml
+      when: containerd_do_containerd | bool
+
+    - name: 29.计算是否需要重启 containerd
+      ansible.builtin.set_fact:
+        containerd_restart_required: >-
+          {{ (containerd_force_restart | default(false) | bool)
+             or (containerd_svc.changed | default(false))
+             or (containerd_svc_start.changed | default(false))
+             or (containerd_cfg_default.changed | default(false))
+             or (containerd_cfg_systemd.changed | default(false))
+             or (containerd_cfg_sandbox.changed | default(false))
+             or (containerd_cfg_path.changed | default(false))
+             or (containerd_cfg_block.changed | default(false))
+             or (containerd_hosts_toml.changed | default(false)) }}
+      when: containerd_do_containerd | bool
+
+    # ---------- 阶段四: 重启与验证 ----------
+    - name: 30.重启 containerd 使配置生效
+      ansible.builtin.systemd:
+        name: containerd
+        state: restarted
+        daemon_reload: true
+      when:
+        - containerd_do_containerd | bool
+        - containerd_restart_required | default(false) | bool
+
+    - name: 31.等待 containerd 达到 active
+      ansible.builtin.command:
+        cmd: systemctl is-active containerd
+      register: containerd_active
+      changed_when: false
+      retries: 6
+      delay: 3
+      until: containerd_active.stdout == "active"
+      when:
+        - containerd_do_containerd | bool
+        - containerd_restart_required | default(false) | bool
+
+    - name: 32.读取运行时配置
+      ansible.builtin.command:
+        cmd: "{{ containerd_bin_dir }}/containerd config dump"
+      register: containerd_cfg_dump
+      changed_when: false
+      failed_when: false
+      when: containerd_do_containerd | bool
+
+    - name: 33.输出配置告警结果
+      ansible.builtin.debug:
+        msg: >-
+          {{ containerd_msg_prefix }}{{ '配置加载无告警' if ((containerd_cfg_dump.stderr | default('')) | trim) == ''
+             else ('发现告警: ' ~ ((containerd_cfg_dump.stderr | default('')) | replace('\n', ' | '))) }}{{ containerd_msg_suffix }}
+      when:
+        - containerd_do_containerd | bool
+        - containerd_check_config_warn | bool
+
+    - name: 34.读取 containerd 版本
+      ansible.builtin.command:
+        cmd: "{{ containerd_bin_dir }}/containerd --version"
+      register: cntd_ver_containerd
+      changed_when: false
+      failed_when: false
+      when: containerd_do_containerd | bool
+
+    - name: 35.读取 runc 版本
+      ansible.builtin.command:
+        cmd: "{{ runc_install_path }} --version"
+      register: cntd_ver_runc
+      changed_when: false
+      failed_when: false
+      when: containerd_do_runc | bool
+
+    - name: 36.读取 crictl 版本
+      ansible.builtin.command:
+        cmd: "{{ containerd_bin_dir }}/crictl --version"
+      register: cntd_ver_crictl
+      changed_when: false
+      failed_when: false
+      when: containerd_do_crictl | bool
+
+    - name: 37.读取 nerdctl 版本
+      ansible.builtin.command:
+        cmd: "{{ containerd_bin_dir }}/nerdctl --version"
+      register: cntd_ver_nerdctl
+      changed_when: false
+      failed_when: false
+      when: containerd_do_nerdctl | bool
+
+    - name: 38.统计 CNI 插件数量
+      ansible.builtin.find:
+        paths: "{{ cni_bin_dir }}"
+        file_type: file
+      register: cntd_cni_files
+      changed_when: false
+      failed_when: false
+      when: containerd_do_cni | bool
+
+    - name: 39.汇总安装结果
+      ansible.builtin.set_fact:
+        cntd_report:
+          containerd_on: "{{ containerd_do_containerd | bool }}"
+          containerd: "{{ cntd_ver_containerd.stdout | default('') | regex_search('v[0-9]+[.][0-9]+[.][0-9]+') | default('', true) }}"
+          runc_on: "{{ containerd_do_runc | bool }}"
+          runc: "{{ cntd_ver_runc.stdout | default('') | regex_search('[0-9]+[.][0-9]+[.][0-9]+') | default('', true) }}"
+          crictl_on: "{{ containerd_do_crictl | bool }}"
+          crictl: "{{ cntd_ver_crictl.stdout | default('') | regex_search('[0-9]+[.][0-9]+[.][0-9]+') | default('', true) }}"
+          nerdctl_on: "{{ containerd_do_nerdctl | bool }}"
+          nerdctl: "{{ cntd_ver_nerdctl.stdout | default('') | regex_search('[0-9]+[.][0-9]+[.][0-9]+') | default('', true) }}"
+          cni_on: "{{ containerd_do_cni | bool }}"
+          cni_count: "{{ cntd_cni_files.matched | default(0) }}"
+
+    - name: 40.输出各组件版本
+      ansible.builtin.debug:
+        msg: >-
+          {{ containerd_msg_prefix }}{{ inventory_hostname }}
+          | containerd {{ cntd_report.containerd if (cntd_report.containerd_on | bool) else '跳过 (开关关闭)' }}
+          | runc {{ cntd_report.runc if (cntd_report.runc_on | bool) else '跳过 (开关关闭)' }}
+          | crictl {{ cntd_report.crictl if (cntd_report.crictl_on | bool) else '跳过 (开关关闭)' }}
+          | nerdctl {{ cntd_report.nerdctl if (cntd_report.nerdctl_on | bool) else '跳过 (开关关闭)' }}
+          | CNI {{ (cntd_report.cni_count ~ ' 个') if (cntd_report.cni_on | bool) else '跳过 (开关关闭)' }}{{ containerd_msg_suffix }}
+
+    - name: 41.输出安装完成提示
+      ansible.builtin.debug:
+        msg:
+          - "{{ containerd_msg_prefix }}  Containerd 已按开关安装完成, 常用检查命令:"
+          - "  systemctl status containerd --no-pager"
+          - "  systemctl is-enabled containerd"
+          - "  containerd --version"
+          - "  配置文件位置: {{ containerd_config_file }}, 修改后需执行 systemctl restart containerd{{ containerd_msg_suffix }}"
+      run_once: true
+      when: containerd_do_containerd | bool
+
+    # ---------- 阶段五: 收尾 ----------
+    - name: 42.清理安装临时目录
+      ansible.builtin.file:
+        path: "{{ staging_dir }}"
+        state: absent
+      when: containerd_cleanup_staging | default(true) | bool

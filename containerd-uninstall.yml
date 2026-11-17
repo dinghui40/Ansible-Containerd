@@ -1,0 +1,270 @@
+---
+# Containerd 卸载剧本
+#
+# 独立于安装剧本, 两者无 include 关系, 但共用 vars/containerd.yml 中的路径变量
+#
+# 清理内容:
+#   - containerd 二进制: containerd, containerd-shim, containerd-shim-runc-v2, containerd-stress, ctr
+#   - systemd 单元: /usr/lib/systemd/system/containerd.service
+#   - runc
+#   - crictl (含 /etc/crictl.yaml)
+#   - nerdctl
+#   - CNI 插件目录 /opt/cni/bin
+#   - /etc/containerd (config.toml, certs.d, 备份)
+#   - 运行态 /run/containerd, 临时目录 /tmp/containerd-install
+#
+# 默认清理全部 5 个组件; 需要保留或只清理某个组件时, 参见下方用法.
+# 安全默认: 保留 /var/lib/containerd 中的镜像 / 容器 / 快照数据, 清理须显式指定参数.
+#
+# 用法:
+#   # 1) 预览会删什么
+#   ansible-playbook containerd-uninstall.yml -e containerd_uninstall_confirm=true --check
+#
+#   # 2) 全部清理 (remove_all 默认 true)
+#   ansible-playbook containerd-uninstall.yml -e containerd_uninstall_confirm=true
+#
+#   # 3) 只清一个组件 (复用安装侧变量)
+#   ansible-playbook containerd-uninstall.yml -e containerd_uninstall_confirm=true -e containerd_install_only=runc
+#
+#   # 4) 保留某个组件 (例如机器上还有别的运行时在用 /opt/cni/bin)
+#   ansible-playbook containerd-uninstall.yml -e containerd_uninstall_confirm=true -e containerd_uninstall_remove_cni=false
+#
+#   # 5) 连数据目录一起清 (不可恢复)
+#   ansible-playbook containerd-uninstall.yml -e containerd_uninstall_confirm=true -e containerd_uninstall_purge_data=true
+
+- name: 卸载 Containerd
+  hosts: containerd_nodes
+  become: true
+  gather_facts: true
+
+  vars_files:
+    - vars/containerd.yml
+
+  vars:
+    # ---------- 组件清理开关 ----------
+    # 默认清理全部组件: 卸载属于清理动作, 不受安装侧默认留空影响
+    # 保留单个组件: -e containerd_uninstall_remove_xxx=false
+    # 仅清理单个组件: -e containerd_install_only=runc, 复用安装侧变量
+    containerd_uninstall_remove_all: true
+    _containerd_remove_only: "{{ containerd_install_only | default('', true) | trim }}"
+    containerd_uninstall_remove_containerd: >-
+      {{ (_containerd_remove_only == 'containerd')
+         or ((_containerd_remove_only == '') and (containerd_uninstall_remove_all | bool)) }}
+    containerd_uninstall_remove_runc: >-
+      {{ (_containerd_remove_only == 'runc')
+         or ((_containerd_remove_only == '') and (containerd_uninstall_remove_all | bool)) }}
+    containerd_uninstall_remove_cni: >-
+      {{ (_containerd_remove_only == 'cni')
+         or ((_containerd_remove_only == '') and (containerd_uninstall_remove_all | bool)) }}
+    containerd_uninstall_remove_crictl: >-
+      {{ (_containerd_remove_only == 'crictl')
+         or ((_containerd_remove_only == '') and (containerd_uninstall_remove_all | bool)) }}
+    containerd_uninstall_remove_nerdctl: >-
+      {{ (_containerd_remove_only == 'nerdctl')
+         or ((_containerd_remove_only == '') and (containerd_uninstall_remove_all | bool)) }}
+
+    # ---------- 目录与数据行为 ----------
+    containerd_uninstall_purge_config: true  # 清 containerd 时连 /etc/containerd 一起删
+    containerd_uninstall_purge_data: false   # 删 /var/lib/containerd (镜像 / 容器数据, 默认保留)
+
+    # ---------- 运行时与数据目录 ----------
+    containerd_data_dir: "/var/lib/containerd"
+    containerd_run_dir: "/run/containerd"
+
+    # ---------- 按组件拆开的删除清单 ----------
+    containerd_core_files:     # containerd 主体 + systemd 单元
+      - "{{ containerd_bin_dir }}/containerd"
+      - "{{ containerd_bin_dir }}/containerd-shim"
+      - "{{ containerd_bin_dir }}/containerd-shim-runc-v2"
+      - "{{ containerd_bin_dir }}/containerd-stress"
+      - "{{ containerd_bin_dir }}/ctr"
+      - "{{ containerd_service_file }}"
+    containerd_runc_files:     # runc
+      - "{{ runc_install_path }}"
+    containerd_crictl_files:   # crictl 二进制 + 配置文件
+      - "{{ containerd_bin_dir }}/crictl"
+      - "{{ crictl_config }}"
+    containerd_nerdctl_files:  # nerdctl
+      - "{{ containerd_bin_dir }}/nerdctl"
+
+    # ---------- 结果复核路径 (顺序与最后汇总一一对应) ----------
+    containerd_uninstall_check_paths:
+      - "{{ containerd_bin_dir }}/containerd"
+      - "{{ runc_install_path }}"
+      - "{{ containerd_service_file }}"
+      - "{{ containerd_config_dir }}"
+      - "{{ cni_bin_dir }}"
+      - "{{ containerd_data_dir }}"
+      - "{{ containerd_bin_dir }}/crictl"
+      - "{{ containerd_bin_dir }}/nerdctl"
+      - "{{ containerd_run_dir }}"
+      - "{{ staging_dir }}"
+
+  tasks:
+    # ---------- 阶段一: 确认与记录 ----------
+    - name: 1.确认执行卸载
+      ansible.builtin.fail:
+        msg:
+          - "本剧本为卸载剧本, 将删除目标机上的 containerd 相关文件."
+          - "确认执行请追加参数: -e containerd_uninstall_confirm=true"
+          - "仅预览删除内容, 在确认参数基础上追加 --check"
+      when: not (containerd_uninstall_confirm | default(false) | bool)
+
+    - name: 2.校验至少清理一个组件
+      ansible.builtin.fail:
+        msg:
+          - "5 个组件的清理开关全部为 false, 没有可清理的内容."
+          - "当前生效值: containerd={{ containerd_uninstall_remove_containerd }} runc={{ containerd_uninstall_remove_runc }} cni={{ containerd_uninstall_remove_cni }} crictl={{ containerd_uninstall_remove_crictl }} nerdctl={{ containerd_uninstall_remove_nerdctl }}"
+          - "全清: -e containerd_uninstall_remove_all=true"
+          - "只清一个: -e containerd_install_only=runc"
+      when: not ((containerd_uninstall_remove_containerd | bool) or (containerd_uninstall_remove_runc | bool)
+                 or (containerd_uninstall_remove_cni | bool) or (containerd_uninstall_remove_crictl | bool)
+                 or (containerd_uninstall_remove_nerdctl | bool))
+
+    - name: 3.记录卸载前状态
+      ansible.builtin.stat:
+        path: "{{ item }}"
+      loop: "{{ containerd_uninstall_check_paths }}"
+      register: uninstall_before
+      changed_when: false
+
+    # ---------- 阶段二: 停服务 ----------
+    - name: 4.停止并禁用 containerd 服务
+      ansible.builtin.systemd:
+        name: containerd
+        state: stopped
+        enabled: false
+      register: uninstall_svc_stop
+      failed_when: false
+      changed_when: uninstall_svc_stop.changed | default(false)
+      when: containerd_uninstall_remove_containerd | bool
+
+    - name: 5.检查残留 containerd 进程
+      ansible.builtin.command:
+        cmd: pgrep -x containerd
+      register: uninstall_proc
+      changed_when: false
+      failed_when: false
+      when: containerd_uninstall_remove_containerd | bool
+
+    - name: 6.结束残留 containerd 进程
+      ansible.builtin.command:
+        cmd: pkill -x containerd
+      # --check 时上一条 command 会被跳过, 结果里没有 rc, 用 default(1) 兜底
+      when:
+        - containerd_uninstall_remove_containerd | bool
+        - (uninstall_proc.rc | default(1)) == 0
+      changed_when: true
+      failed_when: false
+
+    # ---------- 阶段三: 删文件 ----------
+    - name: 7.删除 containerd 二进制与 systemd 单元
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop: "{{ containerd_core_files }}"
+      when: containerd_uninstall_remove_containerd | bool
+
+    - name: 8.删除 runc
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop: "{{ containerd_runc_files }}"
+      when: containerd_uninstall_remove_runc | bool
+
+    - name: 9.删除 crictl 及其配置
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop: "{{ containerd_crictl_files }}"
+      when: containerd_uninstall_remove_crictl | bool
+
+    - name: 10.删除 nerdctl
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop: "{{ containerd_nerdctl_files }}"
+      when: containerd_uninstall_remove_nerdctl | bool
+
+    - name: 11.重载 systemd 单元
+      ansible.builtin.systemd:
+        daemon_reload: true
+      when: containerd_uninstall_remove_containerd | bool
+
+    # ---------- 阶段四: 删目录 ----------
+    - name: 12.清理 CNI 插件目录
+      ansible.builtin.file:
+        path: "{{ cni_bin_dir }}"
+        state: absent
+      when: containerd_uninstall_remove_cni | bool
+
+    - name: 13.清理 /etc/containerd 配置目录
+      ansible.builtin.file:
+        path: "{{ containerd_config_dir }}"
+        state: absent
+      when:
+        - containerd_uninstall_remove_containerd | bool
+        - containerd_uninstall_purge_config | bool
+
+    - name: 14.清理镜像与容器数据目录
+      ansible.builtin.file:
+        path: "{{ containerd_data_dir }}"
+        state: absent
+      when: containerd_uninstall_purge_data | bool
+
+    - name: 15.清理运行时目录
+      ansible.builtin.file:
+        path: "{{ containerd_run_dir }}"
+        state: absent
+      when: containerd_uninstall_remove_containerd | bool
+
+    - name: 16.清理安装临时目录
+      ansible.builtin.file:
+        path: "{{ staging_dir }}"
+        state: absent
+
+    # ---------- 阶段五: 校验与汇总 ----------
+    - name: 17.校验关键路径状态
+      ansible.builtin.stat:
+        path: "{{ item }}"
+      loop: "{{ containerd_uninstall_check_paths }}"
+      register: uninstall_after
+      changed_when: false
+
+    - name: 18.读取服务状态
+      ansible.builtin.command:
+        cmd: systemctl is-active containerd
+      register: uninstall_svc_after
+      changed_when: false
+      failed_when: false
+      when: containerd_uninstall_remove_containerd | bool
+
+    - name: 19.汇总清理结果
+      ansible.builtin.set_fact:
+        uninstall_report:
+          containerd: "{{ '跳过 (开关关闭)' if not (containerd_uninstall_remove_containerd | bool) else (containerd_msg_deleted if not uninstall_after.results[0].stat.exists else '仍存在') }}"
+          runc: "{{ '跳过 (开关关闭)' if not (containerd_uninstall_remove_runc | bool) else (containerd_msg_deleted if not uninstall_after.results[1].stat.exists else '仍存在') }}"
+          service: "{{ '跳过 (开关关闭)' if not (containerd_uninstall_remove_containerd | bool) else (containerd_msg_deleted if not uninstall_after.results[2].stat.exists else '仍存在') }}"
+          config: "{{ '跳过 (开关关闭)' if not ((containerd_uninstall_remove_containerd | bool) and (containerd_uninstall_purge_config | bool)) else (containerd_msg_deleted if not uninstall_after.results[3].stat.exists else '仍存在') }}"
+          cni: "{{ '跳过 (开关关闭)' if not (containerd_uninstall_remove_cni | bool) else (containerd_msg_deleted if not uninstall_after.results[4].stat.exists else '仍存在') }}"
+          data: "{{ containerd_msg_deleted if uninstall_after.results[5].stat.exists is false and (containerd_uninstall_purge_data | bool) else ('保留 (默认不清)' if not (containerd_uninstall_purge_data | bool) else '仍存在') }}"
+          crictl: "{{ '跳过 (开关关闭)' if not (containerd_uninstall_remove_crictl | bool) else (containerd_msg_deleted if not uninstall_after.results[6].stat.exists else '仍存在') }}"
+          nerdctl: "{{ '跳过 (开关关闭)' if not (containerd_uninstall_remove_nerdctl | bool) else (containerd_msg_deleted if not uninstall_after.results[7].stat.exists else '仍存在') }}"
+          run: "{{ '跳过 (开关关闭)' if not (containerd_uninstall_remove_containerd | bool) else (containerd_msg_deleted if not uninstall_after.results[8].stat.exists else '仍存在') }}"
+          staging: "{{ containerd_msg_deleted if not uninstall_after.results[9].stat.exists else '仍存在' }}"
+
+    - name: 20.输出卸载结果
+      ansible.builtin.debug:
+        msg:
+          - "containerd 二进制          : {{ uninstall_report.containerd }}"
+          - "runc                       : {{ uninstall_report.runc }}"
+          - "systemd 单元               : {{ uninstall_report.service }}"
+          - "crictl + /etc/crictl       : {{ uninstall_report.crictl }}"
+          - "nerdctl                    : {{ uninstall_report.nerdctl }}"
+          - "/opt/cni/bin               : {{ uninstall_report.cni }}"
+          - "/etc/containerd            : {{ uninstall_report.config }}"
+          - "/run/containerd            : {{ uninstall_report.run }}"
+          - "/tmp/containerd-install    : {{ uninstall_report.staging }}"
+          - "/var/lib/containerd        : {{ uninstall_report.data }}"
+          - "服务状态                   : {{ uninstall_svc_after.stdout | default('预览模式未查询' if ansible_check_mode else '未检查 (开关关闭)', true) }}"
+          - "卸载前 containerd 是否存在 : {{ '是' if uninstall_before.results[0].stat.exists else '否 (本就未安装)' }}"

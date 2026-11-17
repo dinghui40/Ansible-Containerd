@@ -1,0 +1,3 @@
+# 只写一行整包文件名, 版本号由你填写, 流水线运行时直接读取此行.
+# 包内为 packages 目录与 SHA256SUMS, 安装包下载版本仍以 vars/containerd.yml 为准.
+ansible-containerd-bundle-2.4.2-amd64.tar.gz

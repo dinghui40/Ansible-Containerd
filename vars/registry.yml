@@ -1,0 +1,57 @@
+---
+# 仓库与镜像加速配置
+#
+# 每个仓库生成一份 /etc/containerd/certs.d/<registry>/hosts.toml,
+# 由 templates/hosts.toml.j2 渲染; 
+#
+# 三种形态:
+#   1) 只配镜像加速      mirrors 非空, 生成 server 行与 [host."<加速地址>"] 段
+#   2) 只配不安全/认证   mirrors 留空, 生成 [host."<官方地址>"] 段, 含 skip_verify 与 [host."<官方地址>".auth], 不写 server 行
+#   3) 两者都配         先生成加速段, 再生成 [host."<官方地址>"] 段, 以空行分隔
+#
+# ---------- 证书目录 ----------
+# 写入 config.toml 的 config_path, 默认与 containerd_certs_dir 保持一致
+containerd_registry_config_path: "{{ containerd_certs_dir }}"
+
+# ---------- 仓库列表 ----------
+# registry : 仓库域名, 同时决定 /etc/containerd/certs.d/<registry> 目录名
+# server   : 官方地址, 写入 hosts.toml 的 server 行; 缺省为 https://<registry>
+# mirrors  : 加速地址列表, 按顺序尝试
+#            host        加速地址, 必填
+#            capabilities 能力列表, 缺省 ["pull", "resolve"]
+#            skip_verify  仅对该加速地址跳过证书校验, 缺省 false
+# insecure : true 时为官方地址追加 skip_verify, 适用于自签证书或明文 HTTP 仓库
+# auth     : 填写 username / password 后生成 [host."<server>".auth] 段
+containerd_registries:
+  - registry: "docker.io"
+    server: "https://docker.io"
+    mirrors:
+      - host: "https://docker.m.daocloud.io"
+        capabilities: ["pull", "resolve"]
+      # - host: ""
+      #   capabilities: ["pull", "resolve"]
+    insecure: false
+    auth:
+      username: ""
+      password: ""
+
+  # ---------- 配置自签证书的内网仓库 ----------
+  # - registry: "harbor.example.com"
+  #   server: "https://harbor.example.com"
+  #   mirrors: []
+  #   insecure: true
+  #   auth:
+  #     username: "admin"
+  #     password: "Harbor12345"
+
+  # ---------- 加速与认证同时存在 ----------
+  # 先生成加速段, 再生成官方地址段, 两段之间有空行; auth 段嵌在官方地址段内
+  # - registry: "harbor.example.com"
+  #   server: "https://harbor.example.com"
+  #   mirrors:
+  #     - host: "https://harbor.mirror.example.com"
+  #       capabilities: ["pull", "resolve"]
+  #   insecure: true
+  #   auth:
+  #     username: "admin"
+  #     password: "Harbor12345"

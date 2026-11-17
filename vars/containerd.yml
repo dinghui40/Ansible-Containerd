@@ -1,0 +1,132 @@
+---
+# Containerd 安装参数
+#
+# 本文件内容: 版本 / 架构 / 安装包名 / 组件开关 / 路径 / 下载源 / 运行参数 / 行为开关
+# 仓库与镜像加速配置位于 vars/registry.yml
+#
+# 升级版本步骤:
+#   1) 修改下方 *_version
+#   2) 删除 packages 目录中的旧安装包
+#   3) 执行 bash scripts/download-containerd.sh --force
+
+# ---------- 组件版本 ----------
+containerd_version: "2.4.2"
+runc_version: "1.5.2"
+cni_plugins_version: "1.9.1"
+crictl_version: "1.37.0"
+nerdctl_version: "2.4.2"
+
+# ---------- 架构 ----------
+containerd_arch: "amd64"    # 可选 amd64 / arm64
+
+# ---------- 安装包名 ----------
+# 由版本与架构自动拼接, 通常无需修改
+containerd_pkg: "containerd-{{ containerd_version }}-linux-{{ containerd_arch }}.tar.gz"
+runc_pkg: "runc.{{ containerd_arch }}"
+cni_plugins_pkg: "cni-plugins-linux-{{ containerd_arch }}-v{{ cni_plugins_version }}.tgz"
+crictl_pkg: "crictl-v{{ crictl_version }}-linux-{{ containerd_arch }}.tar.gz"
+nerdctl_pkg: "nerdctl-{{ nerdctl_version }}-linux-{{ containerd_arch }}.tar.gz"
+
+# ---------- 组件安装开关 ----------
+# 三态取值:
+#   留空  = 未指定: 单独执行时不安装; 与 containerd_install_all=true 一同使用时随全量安装
+#   true  = 安装
+#   false = 明确不安装, 即使 containerd_install_all=true 也排除
+# 默认全部留空, 避免未指定参数时误装
+containerd_install_containerd:      # containerd 主体: 二进制 + systemd 单元 + config.toml + 镜像仓库配置
+containerd_install_runc:            # runc 容器运行时
+containerd_install_cni:             # CNI 插件, 解压至 /opt/cni/bin
+containerd_install_crictl:          # crictl 与 /etc/crictl.yaml
+containerd_install_nerdctl:         # nerdctl
+
+# 全量安装开关: -e containerd_install_all=true
+# 全量安装并排除组件: -e containerd_install_all=true -e containerd_install_crictl=false
+containerd_install_all: false
+
+# 仅安装单个组件: -e containerd_install_only=组件名
+# 优先级最高, 取值后忽略 containerd_install_all 与 5 个组件开关
+# 可选值: containerd / runc / cni / crictl / nerdctl
+containerd_install_only: ""
+
+# ---------- 生效开关 (由上方变量计算, 请勿手工修改) ----------
+# 剧本任务只读取以下 5 个变量
+# 优先级: containerd_install_only > 显式 true / 显式 false > containerd_install_all > 未指定
+_containerd_only: "{{ containerd_install_only | default('', true) | trim }}"
+
+containerd_do_containerd: >-
+  {{ (_containerd_only == 'containerd')
+     or ((_containerd_only == '')
+         and (((containerd_install_containerd is not none) and (containerd_install_containerd | bool))
+              or ((containerd_install_containerd is none) and (containerd_install_all | bool)))) }}
+containerd_do_runc: >-
+  {{ (_containerd_only == 'runc')
+     or ((_containerd_only == '')
+         and (((containerd_install_runc is not none) and (containerd_install_runc | bool))
+              or ((containerd_install_runc is none) and (containerd_install_all | bool)))) }}
+containerd_do_cni: >-
+  {{ (_containerd_only == 'cni')
+     or ((_containerd_only == '')
+         and (((containerd_install_cni is not none) and (containerd_install_cni | bool))
+              or ((containerd_install_cni is none) and (containerd_install_all | bool)))) }}
+containerd_do_crictl: >-
+  {{ (_containerd_only == 'crictl')
+     or ((_containerd_only == '')
+         and (((containerd_install_crictl is not none) and (containerd_install_crictl | bool))
+              or ((containerd_install_crictl is none) and (containerd_install_all | bool)))) }}
+containerd_do_nerdctl: >-
+  {{ (_containerd_only == 'nerdctl')
+     or ((_containerd_only == '')
+         and (((containerd_install_nerdctl is not none) and (containerd_install_nerdctl | bool))
+              or ((containerd_install_nerdctl is none) and (containerd_install_all | bool)))) }}
+
+# ---------- 路径 ----------
+packages_dir: "{{ playbook_dir }}/packages"                  # 控制节点安装包目录
+configs_dir: "{{ playbook_dir }}/configs"                    # 仓库内置配置文件目录
+templates_dir: "{{ playbook_dir }}/templates"                # Jinja2 模板目录
+hosts_toml_template: "{{ templates_dir }}/hosts.toml.j2"     # 渲染每个仓库的 hosts.toml
+containerd_service_src: "{{ configs_dir }}/containerd.service"
+crictl_config_src: "{{ configs_dir }}/crictl.yaml"
+download_script: "{{ playbook_dir }}/scripts/download-containerd.sh"
+staging_dir: "/tmp/containerd-install"                       # 目标机解压临时目录
+containerd_bin_dir: "/usr/local/bin"
+runc_install_path: "/usr/local/sbin/runc"
+cni_bin_dir: "/opt/cni/bin"
+crictl_config: "/etc/crictl.yaml"
+containerd_config_dir: "/etc/containerd"
+containerd_config_file: "/etc/containerd/config.toml"
+containerd_certs_dir: "/etc/containerd/certs.d"
+containerd_service_file: "/usr/lib/systemd/system/containerd.service"
+
+# ---------- 下载源 ----------
+# 下载脚本优先直连 GitHub, 失败后按此顺序尝试加速前缀
+download_mirror_prefixes: "https://v4.gh-proxy.org https://ghfast.top https://ghproxy.net"
+
+
+
+# ---------- Containerd 运行参数 ----------
+containerd_systemd_cgroup: true
+containerd_sandbox_image: "registry.aliyuncs.com/google_containers/pause:3.10.2"
+
+# ---------- 输出样式 ----------
+# 以下三处输出使用绿色: 配置告警结果 / 各组件版本 / 安装完成提示
+# 输出重定向到文件且不希望保留控制字符时, 将 containerd_output_color 设为 false
+containerd_output_color: true
+containerd_ansi_green: "\u001b[32m"
+containerd_ansi_reset: "\u001b[0m"
+containerd_msg_prefix: "{{ containerd_ansi_green if containerd_output_color | bool else '' }}"
+containerd_msg_suffix: "{{ containerd_ansi_reset if containerd_output_color | bool else '' }}"
+# 卸载报告中已删除三个字单独显示为绿色, 同行其余文字保持原色
+containerd_msg_deleted: "{{ (containerd_ansi_green ~ '已删除' ~ containerd_ansi_reset) if containerd_output_color | bool else '已删除' }}"
+
+# ---------- 行为开关 ----------
+# false = 缺包时报错并提示手动执行下载脚本
+# true  = 缺包时由剧本自动调用下载脚本
+containerd_auto_download: false
+# 是否校验 containerd config dump 的告警输出
+containerd_check_config_warn: true
+# 安装结束后是否删除目标机临时目录 staging_dir
+# 设为 false 可保留现场, 便于排查解压与安装问题
+containerd_cleanup_staging: true
+# true 时无论配置是否变更都重启 containerd
+# 默认仅在服务单元 / config.toml / hosts.toml 发生变化时重启
+containerd_force_restart: false
